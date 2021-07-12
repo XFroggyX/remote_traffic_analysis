@@ -3,6 +3,9 @@
 #include <windows.h>
 #include <thread>
 #include <conio.h>
+#include <fstream>
+#include <codecvt>
+#include <locale>
 
 
 #pragma comment(lib, "ws2_32.lib")
@@ -24,15 +27,37 @@ typedef struct IPHeader {
     ULONG   iph_dest;     // IP-адрес назначения
 }IPHeader;
 
-void print_stat(IPHeader *pHeader, WORD size, char string[65536]);
+void start_sniffer(IPHeader *pHeader, WORD size);
 
 std::string get_protocol_name(UCHAR aProtocol);
 
-int main() {
+void save_in_file(std::ostream &logfile, IPHeader *pHeader, WORD size, char buffer[65536]);
+
+void select_content_and_push(std::ostream &ostream, const char *buf, int size);
+
+int main(int argc, char* argv[]) {
     /*init*/
     WSADATA wsadata;
-    SOCKET s;
+    SOCKET sniffer;
+    struct in_addr addr{};
     char btBuffer[65536]; //буфер на 64кб
+    char file_name[1024];
+    strcpy(file_name, "log.txt");
+    bool status_file = false;
+    if (argc == 2) {
+        if (strcmp(argv[1],"-f") == 0)
+            status_file = true;
+        else{
+            std::cout << "The parameter is missing" << std::endl;
+        }
+    } else if (argc == 3) {
+        if (strcmp(argv[1],"-f") == 0) {
+            status_file = true;
+            memcpy(&file_name, argv[2], strlen(argv[2]));
+        } else {
+            std::cout << "The parameter is missing" << std::endl;
+        }
+    }
 
     //Инициализация сокетов
     if(WSAStartup (MAKEWORD(2, 2), &wsadata) != 0) {
@@ -42,8 +67,8 @@ int main() {
     }
 
     //Создание сокета
-    s = socket (AF_INET, SOCK_RAW, IPPROTO_IP);
-    if(s == INVALID_SOCKET) {
+    sniffer = socket (AF_INET, SOCK_RAW, IPPROTO_IP);
+    if(sniffer == INVALID_SOCKET) {
         std::cout << "ERROR. Socket not created" << std::endl;
     } else {
         std::cout << "Socket created" << std::endl;
@@ -51,8 +76,20 @@ int main() {
 
     CHAR szHostName[16];
 
+    std::ofstream logfile(file_name);
+    if (status_file) {
+        if(!logfile.is_open()) {
+            printf("ERROR. Unable to create file.");
+        }
+    }
+
+    //const std::locale utf8_locale = std::locale(std::locale(), new std::codecvt_utf8<char16_t>);
+    //logfile.imbue(utf8_locale);
+
+
+
     //Получение имени локального хоста
-    if(gethostname (szHostName, sizeof szHostName) != 0) {
+    if(gethostname(szHostName, sizeof(szHostName)) != 0) {
         std::cout << "ERROR. Hostname not received" << std::endl;
     } else {
         std::cout << "Hostname received" << std::endl;
@@ -66,14 +103,29 @@ int main() {
     } else {
         std::cout << "Host description received" << std::endl;
 
-        SOCKADDR_IN sa; //Адрес хоста
+        int i = 0;
+        for (i = 0; phe->h_addr_list[i] != nullptr; ++i) {
+            memcpy(&addr, phe->h_addr_list[i], sizeof(struct in_addr));
+            printf("Interface Number : %d Address : %s\n",i,inet_ntoa(addr));
+        }
 
+        std::cout << "Select network interface: ";
+        int index_select_in = -1;
+        std::cin >> index_select_in;
+        if (index_select_in == -1 || index_select_in > i) {
+            return -1;
+        }
+
+        //Структура с адресом выбранного сетевого интерфейса
+        SOCKADDR_IN sa; //Адрес хоста
         ZeroMemory(&sa, sizeof (sa));
+        sa.sin_port = 0;
         sa.sin_family = AF_INET;
-        sa.sin_addr.s_addr = ((struct in_addr *) phe->h_addr_list[0])->s_addr;
+        sa.sin_addr.s_addr = ((struct in_addr *) phe->h_addr_list[index_select_in])->s_addr;
+
 
         //Связывание локального адреса и сокета
-        if(bind (s, (SOCKADDR *) &sa, sizeof (SOCKADDR)) != 0) {
+        if(bind(sniffer, (SOCKADDR *)&sa, sizeof(SOCKADDR)) != 0) {
             std::cout << "ERROR. The socket is not bind" << std::endl;
         } else {
             std::cout << "The socket is bind" << std::endl;
@@ -81,31 +133,66 @@ int main() {
             //Включение promiscuous mode
             DWORD flag = TRUE;     //Флаг PROMISC Вкл/Выкл
 
-            if(ioctlsocket (s, SIO_RCVALL, &flag) == SOCKET_ERROR) {
-                std::cout << "ERRPR. Promiscuous mode is not enabled" << std::endl;
+            if(ioctlsocket(sniffer, SIO_RCVALL, &flag) == SOCKET_ERROR) {
+                std::cout << "ERROR. Promiscuous mode is not enabled" << std::endl;
             } else {
                 std::cout << "Promiscuous mode is enabled" << std::endl;
             }
         }
+
        while(!kbhit()) {
-           if (recv(s, btBuffer, sizeof(btBuffer), 0) >= sizeof(IPHeader)) {
-               IPHeader *hdr = (IPHeader *) btBuffer;
+           if (recv(sniffer, btBuffer, sizeof(btBuffer), 0) >= sizeof(IPHeader)) {
+               auto *hdr = (IPHeader *) btBuffer;
 
                WORD size = (hdr->iph_length << 8) + (hdr->iph_length >> 8);
 
                //Получен пакет?
-               //if (size >= 60 && size <= 1500) {
-               print_stat (hdr, size, btBuffer);
-               //}
+               if (size >= 60 && size <= 1500) {
+                   start_sniffer (hdr, size);
+                   if (status_file)
+                       save_in_file(logfile, hdr, size, btBuffer);
+               }
            }
        }
     }
 
-
+    closesocket(sniffer);
+    WSACleanup();
     return 0;
 }
 
-void print_stat(IPHeader *pHeader, WORD size, char btBuffer[65536]) {
+void save_in_file(std::ostream &logfile, IPHeader *pHeader, WORD size, char buffer[65536]) {
+    IN_ADDR ia;
+
+    logfile << "--Packet begin--\r\n";
+    logfile << "From ";
+    ia.s_addr = pHeader->iph_src;
+    logfile << inet_ntoa(ia) << "\n";
+
+    logfile << "To ";
+    ia.s_addr = pHeader->iph_dest;
+    logfile << inet_ntoa(ia) << "\n";
+
+    logfile << "ID: ";
+    logfile << pHeader->iph_id << "\n";
+
+    logfile << "Protocol: ";
+    logfile << get_protocol_name(pHeader->iph_protocol) << "\n";
+
+    logfile << "Packet length: ";
+    logfile << size << "\n";
+    logfile << "\n";
+
+    char contents_buf[size - sizeof(IPHeader) * 2];
+    logfile << "Contents:\r\n\r\n";
+    memcpy(&contents_buf, &buffer[sizeof(IPHeader) * 2], size - sizeof(IPHeader) * 2);
+
+    logfile << (std::string)contents_buf;
+
+    logfile << "\n\r--Packet end--\r\n";
+}
+
+void start_sniffer(IPHeader *pHeader, WORD size) {
     IN_ADDR ia;
     std::cout << "From ";
     ia.s_addr = pHeader->iph_src;
@@ -124,9 +211,6 @@ void print_stat(IPHeader *pHeader, WORD size, char btBuffer[65536]) {
     std::cout << "Packet length: ";
     printf("%d\t", size);
     std::cout << std::endl;
-
-
-    std::cout << std::endl << std::endl;
 }
 
 std::string get_protocol_name(UCHAR aProtocol) {
