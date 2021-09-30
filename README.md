@@ -1,2 +1,2 @@
-# remote_traffic_analysis
+# traffic_analysis
 Программа для анализа сетевого трафика
